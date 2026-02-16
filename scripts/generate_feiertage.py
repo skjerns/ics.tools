@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Generate Feiertage ICS files for all 16 German Bundesländer."""
+"""Generate Feiertage and Ferien ICS files for all 16 German Bundesländer."""
 
 import argparse
 import hashlib
+import json
 import os
+import urllib.parse
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
 
 PRODID = "ics.tools skjerns patch"
 URL = "https://ics.tools"
+FERIEN_API = "https://openholidaysapi.org/SchoolHolidays"
+MAX_BATCH_DAYS = 1000
 
 STATES = [
     "baden-württemberg",
@@ -28,6 +33,25 @@ STATES = [
     "schleswig-holstein",
     "thüringen",
 ]
+
+SUBDIVISION_CODES = {
+    "baden-württemberg":    "DE-BW",
+    "bayern":               "DE-BY",
+    "berlin":               "DE-BE",
+    "brandenburg":          "DE-BB",
+    "bremen":               "DE-HB",
+    "hamburg":              "DE-HH",
+    "hessen":               "DE-HE",
+    "mecklenburg-vorpommern": "DE-MV",
+    "niedersachsen":        "DE-NI",
+    "nordrhein-westfalen":  "DE-NW",
+    "rheinland-pfalz":      "DE-RP",
+    "saarland":             "DE-SL",
+    "sachsen-anhalt":       "DE-ST",
+    "sachsen":              "DE-SN",
+    "schleswig-holstein":   "DE-SH",
+    "thüringen":            "DE-TH",
+}
 
 
 def easter_sunday(year: int) -> date:
@@ -196,23 +220,107 @@ def write_feiertage(state: str, year_start: int, year_end: int,
     print(f"  {out_path}")
 
 
+def fetch_ferien_api(subdivision_code: str, from_date: date, to_date: date) -> list[dict]:
+    """Fetch school holidays from OpenHolidays API in batches of at most MAX_BATCH_DAYS days."""
+    results = []
+    current = from_date
+    while current <= to_date:
+        batch_end = min(current + timedelta(days=MAX_BATCH_DAYS - 1), to_date)
+        params = urllib.parse.urlencode({
+            "countryIsoCode": "DE",
+            "subdivisionCode": subdivision_code,
+            "validFrom": current.strftime("%Y-%m-%d"),
+            "validTo":   batch_end.strftime("%Y-%m-%d"),
+        })
+        req = urllib.request.Request(
+            f"{FERIEN_API}?{params}",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            results.extend(json.loads(resp.read()))
+        current = batch_end + timedelta(days=1)
+
+    # Deduplicate entries that appear in overlapping batch windows
+    seen: set[tuple] = set()
+    unique = []
+    for item in results:
+        key = (item["startDate"], item["endDate"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def german_name(name_list: list[dict]) -> str:
+    for entry in name_list:
+        if entry.get("language") == "DE":
+            return entry["text"]
+    return name_list[0]["text"] if name_list else "Ferien"
+
+
+def write_ferien(state: str, year_start: int, year_end: int,
+                 output_dir: str, timestamp: str) -> None:
+    code = SUBDIVISION_CODES[state]
+    state_title = state.title()
+    cal_name = f"{state_title} Ferien"
+
+    print(f"  {state} ({code}) ...", end="", flush=True)
+    holidays = fetch_ferien_api(code, date(year_start, 1, 1), date(year_end, 12, 31))
+    print(f" {len(holidays)} entries")
+
+    events = []
+    for h in sorted(holidays, key=lambda x: x["startDate"]):
+        name = german_name(h["name"])
+        start = date.fromisoformat(h["startDate"])
+        # API endDate is the last inclusive day; ICS DTEND is exclusive
+        end = date.fromisoformat(h["endDate"]) + timedelta(days=1)
+        summary = f"{name} {start.year} {state_title}"
+        events.append(vevent(summary, start, end, timestamp))
+
+    parts = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        f"PRODID:{PRODID}",
+        *events,
+        f"NAME:{cal_name}",
+        f"X-WR-CALNAME:{cal_name}",
+        "METHOD:PUBLISH",
+        "END:VCALENDAR",
+    ]
+    content = "\r\n".join(parts) + "\r\n"
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"{state}.ics")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"  → {out_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate Feiertage ICS files for all German Bundesländer."
+        description="Generate Feiertage and Ferien ICS files for all German Bundesländer."
     )
     parser.add_argument("--year_start", type=int, required=True, help="First year (inclusive)")
     parser.add_argument("--year_end",   type=int, required=True, help="Last year (inclusive)")
-    parser.add_argument("--output_dir", default="Feiertage",
-                        help="Output directory (default: Feiertage/)")
+    parser.add_argument("--feiertage_dir", default="Feiertage",
+                        help="Output directory for Feiertage (default: Feiertage/)")
+    parser.add_argument("--ferien_dir", default="Ferien",
+                        help="Output directory for Ferien (default: Ferien/)")
     args = parser.parse_args()
 
     if args.year_start > args.year_end:
         parser.error("year_start must be <= year_end")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    print(f"Generating Feiertage for {args.year_start}–{args.year_end} → {args.output_dir}/")
+
+    print(f"Generating Feiertage {args.year_start}–{args.year_end} → {args.feiertage_dir}/")
     for state in STATES:
-        write_feiertage(state, args.year_start, args.year_end, args.output_dir, timestamp)
+        write_feiertage(state, args.year_start, args.year_end, args.feiertage_dir, timestamp)
+
+    print(f"\nFetching Ferien {args.year_start}–{args.year_end} → {args.ferien_dir}/")
+    for state in STATES:
+        write_ferien(state, args.year_start, args.year_end, args.ferien_dir, timestamp)
+
     print("Done.")
 
 
